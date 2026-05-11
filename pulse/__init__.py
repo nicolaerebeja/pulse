@@ -1,0 +1,1 @@
+"""Pulse — personal content aggregator with AI summarization."""
