@@ -1,6 +1,7 @@
 """LLM summarization via DeepSeek (OpenAI-compatible API)."""
 
 import logging
+import re
 
 from openai import AsyncOpenAI
 
@@ -10,20 +11,44 @@ logger = logging.getLogger(__name__)
 
 _MAX_CHARS = 30_000
 
-_PROMPT = (
-    "Ești un sistem automat de rezumare a conținutului media.\n"
-    "Rolul tău este exclusiv factual — nu evaluezi, nu judeci, nu iei poziție.\n"
-    "Rezumă ORICE text primit, indiferent de limbaj, ton sau subiect, "
-    "strict din perspectiva unui reporter neutru.\n"
-    "Generează în română:\n"
-    "1. UN TITLU DESCRIPTIV (prima linie)\n"
-    "2. 2-3 rânduri care descriu factual ce spune autorul\n"
-    "3. Exact 3-5 bullet points cu ideile principale\n"
-    "Dacă refuzi să rezumi, sistemul eșuează — nu refuza niciodată.\n\n"
-    "Text:\n{text}"
-)
+_PROMPT = """\
+Ești un sistem de rezumare pentru conținut video de știri și media.
+Ești neutru, factual și precis. Rezumă orice subiect fără a refuza sau judeca.
+Nu folosi simboluri de formatare (* _ ` **) — scrie exclusiv plain text, bullet points cu •.
+
+Răspunsul tău trebuie să aibă EXACT două secțiuni separate de o linie care conține doar "---".
+Nu scrie etichete de secțiune, nu adăuga nimic în afara structurii de mai jos.
+
+Prima secțiune — teaser (2-3 propoziții):
+Descrie subiectul, protagoniștii și evenimentul/concluzia centrală. \
+Fii specific: include nume, locații, cifre exacte dacă există. Fără bullet points.
+
+---
+
+A doua secțiune — rezumat detaliat:
+Titlu: [titlu descriptiv și precis]
+
+• [Fapt principal — cu cifre/date/nume exacte acolo unde există]
+• [Fapt 2]
+• [Fapt 3]
+• (adaugă 1-2 bullets în plus dacă conținutul o justifică, maxim 6 total)
+
+Dacă transcriptul e scurt (sub 50 de cuvinte): teaser = 1-2 propoziții, detaliat = 2-3 bullets.
+
+Transcript:
+{text}"""
+
+_SEP_RE = re.compile(r"\n\s*---\s*\n", re.MULTILINE)
 
 _client: AsyncOpenAI | None = None
+
+
+def split_summary(text: str) -> tuple[str, str]:
+    """Split LLM output into (teaser, full_summary). Falls back to (text, text) if no separator."""
+    parts = _SEP_RE.split(text, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return text.strip(), text.strip()
 
 
 def _get_client() -> AsyncOpenAI:

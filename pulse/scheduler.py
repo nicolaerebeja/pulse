@@ -2,12 +2,13 @@
 
 import logging
 from datetime import datetime, timezone
+from html import escape
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from pulse.config import settings
 from pulse.db import execute, fetch_all, fetch_one, fetch_value
-from pulse.llm import summarize
+from pulse.llm import split_summary, summarize
 from pulse.youtube import fetch_recent_videos, get_transcript
 
 logger = logging.getLogger(__name__)
@@ -150,8 +151,12 @@ async def _notify_subscribers(bot: Bot, channel_id: int, video: dict) -> None:
         ch_id=channel_id,
     )
 
-    title_line = f"*{video['title']}*\n\n" if video.get("title") else ""
-    text = f"🎬 {title_line}{video['summary']}\n\n🔗 https://youtube.com/watch?v={video['yt_id']}"
+    teaser, _full = split_summary(video["summary"])
+    title_line = f"<b>{escape(video['title'])}</b>\n\n" if video.get("title") else ""
+    text = f"🎬 {title_line}{escape(teaser)}\n\n🔗 https://youtube.com/watch?v={video['yt_id']}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📖 Rezumat complet", callback_data=f"full:{video['yt_id']}")
+    ]])
 
     for row in chats:
         chat_id = row["chat_id"]
@@ -162,7 +167,7 @@ async def _notify_subscribers(bot: Bot, channel_id: int, video: dict) -> None:
         if already:
             continue
         try:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
             await execute(
                 "INSERT INTO notif_sent (chat_id, video_yt_id) VALUES (:cid, :vid) ON CONFLICT DO NOTHING",
                 cid=chat_id, vid=video["yt_id"],

@@ -1,19 +1,37 @@
 """Telegram bot — all command and message handlers in one file."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from html import escape
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from pulse.config import settings
 from pulse.db import execute, fetch_all, fetch_one, fetch_value
-from pulse.llm import summarize
+from pulse.llm import split_summary, summarize
 from pulse.youtube import extract_video_id, get_transcript, is_video_url, resolve_channel
 
 logger = logging.getLogger(__name__)
 
 _startup_time: datetime = datetime.now(timezone.utc)
+
+
+def _rel_time(dt: datetime | None) -> str:
+    """Return human-readable relative time: 'acum 3 min', 'acum 2h 15min', or absolute date."""
+    if not dt:
+        return "—"
+    diff = datetime.now(timezone.utc) - dt
+    total_minutes = int(diff.total_seconds() // 60)
+    if total_minutes < 1:
+        return "acum"
+    if total_minutes < 60:
+        return f"acum {total_minutes} min"
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+    if hours < 24:
+        return f"acum {hours}h {mins}min" if mins else f"acum {hours}h"
+    return dt.strftime("%d %b %H:%M UTC")
 
 
 # ---------------------------------------------------------------------------
@@ -50,22 +68,29 @@ async def _find_channel_by_input(text: str) -> dict | None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _register_chat(update)
     await update.message.reply_text(
-        "👋 Bun venit în Pulse!\n\n"
-        "Trimite-mi un link de canal YouTube pentru a-l urmări:\n"
-        "  /add https://youtube.com/@numecanal\n\n"
-        "Sau trimite direct un link de video și primești rezumatul instant.\n\n"
-        "/help — toate comenzile"
+        "👋 <b>Bun venit în Pulse!</b>\n\n"
+        "Ce fac:\n"
+        "• Monitorizez canale YouTube și îți trimit automat rezumat pentru fiecare video nou\n"
+        "• La link direct de video, generez rezumatul în câteva secunde\n\n"
+        "Cum începi:\n"
+        f"<code>/add https://youtube.com/@numecanal</code>\n\n"
+        f"Verificare automată la fiecare {settings.poll_interval_minutes} minute.\n"
+        "/help — toate comenzile",
+        parse_mode="HTML",
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📖 Comenzi:\n\n"
-        "/add <url_canal> — urmărește un canal YouTube\n"
-        "/sources — lista canalelor urmărite în acest chat\n"
-        "/remove <yt_id> — șterge un abonament\n"
-        "/status — statistici\n\n"
-        "Trimite orice link video YouTube → rezumat instant."
+        "📖 <b>Comenzi Pulse</b>\n\n"
+        "/add <code>&lt;url_canal&gt;</code> — abonează-te la un canal YouTube\n"
+        "    Ex: <code>/add https://youtube.com/@Reuters</code>\n\n"
+        "/sources — canalele urmărite în acest chat, cu statistici\n\n"
+        "/remove <code>&lt;nume_sau_id&gt;</code> — șterge un abonament\n"
+        "    Ex: <code>/remove Reuters</code>\n\n"
+        "/status — starea botului, scheduler, activitate per canal\n\n"
+        "🔗 <b>Link video YouTube</b> direct în chat → rezumat instant (teaser + buton detalii)",
+        parse_mode="HTML",
     )
 
 
@@ -117,8 +142,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     logger.info("add channel chat=%s yt_id=%s", chat_id, yt_id)
     await update.message.reply_text(
-        f"✅ Canal adăugat: *{name}*\n\nPrima verificare în maxim {settings.poll_interval_minutes} minute.",
-        parse_mode="Markdown",
+        f"✅ Canal adăugat: <b>{escape(name)}</b>\n\nPrima verificare în maxim {settings.poll_interval_minutes} minute.",
+        parse_mode="HTML",
     )
 
 
@@ -127,38 +152,61 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.effective_chat.id
     rows = await fetch_all(
         """
-        SELECT yc.yt_id, yc.name, yc.checked_at
+        SELECT yc.yt_id, yc.name, yc.checked_at,
+               COUNT(v.id)        AS video_count,
+               MAX(v.processed_at) AS last_video_at
           FROM yt_channels yc
           JOIN chat_subs cs ON cs.yt_channel_id = yc.id
+          LEFT JOIN videos v ON v.yt_channel_id = yc.id
          WHERE cs.chat_id = :cid
+         GROUP BY yc.id, yc.yt_id, yc.name, yc.checked_at
          ORDER BY yc.name
         """,
         cid=chat_id,
     )
     if not rows:
-        await update.message.reply_text("Nu urmărești niciun canal. Folosește /add <url> pentru a adăuga unul.")
+        await update.message.reply_text(
+            "Nu urmărești niciun canal.\n"
+            "Adaugă unul cu: <code>/add https://youtube.com/@numecanal</code>",
+            parse_mode="HTML",
+        )
         return
 
-    lines = ["📋 Canale urmărite în acest chat:\n"]
+    lines = [f"📋 <b>Canale urmărite</b> ({len(rows)} total)\n"]
     for row in rows:
-        last = row["checked_at"].strftime("%d %b %H:%M") if row["checked_at"] else "—"
-        lines.append(f"🎬 {row['name'] or row['yt_id']}\n   ID: `{row['yt_id']}` | Verificat: {last}")
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+        name = escape(row["name"] or row["yt_id"])
+        yt_id = escape(row["yt_id"])
+        checked = _rel_time(row["checked_at"])
+        last_vid = _rel_time(row["last_video_at"]) if row["last_video_at"] else "—"
+        count = row["video_count"] or 0
+        lines.append(
+            f"🎬 <b>{name}</b>\n"
+            f"   ID: <code>{yt_id}</code>\n"
+            f"   Verificat: {checked} | Ultimul video: {last_vid} | {count} procesate"
+        )
+    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _register_chat(update)
     args = context.args or []
     if not args:
-        await update.message.reply_text("Utilizare: /remove <yt_id>\nVezi ID-urile cu /sources.")
+        await update.message.reply_text(
+            "Utilizare: <code>/remove &lt;nume_sau_id&gt;</code>\n"
+            "Ex: <code>/remove Reuters</code>\nVezi canalele cu /sources.",
+            parse_mode="HTML",
+        )
         return
 
-    yt_id = args[0]
+    query = " ".join(args)
     chat_id = update.effective_chat.id
 
-    channel = await fetch_one("SELECT id, name FROM yt_channels WHERE yt_id = :yt_id", yt_id=yt_id)
+    channel = await fetch_one(
+        "SELECT id, name, yt_id FROM yt_channels WHERE yt_id = :q OR lower(name) = lower(:q)",
+        q=query,
+    )
     if not channel:
-        await update.message.reply_text("❌ Canal negăsit. Verifică ID-ul cu /sources.")
+        await update.message.reply_text("❌ Canal negăsit. Verifică cu /sources.")
         return
 
     deleted = await execute(
@@ -169,23 +217,77 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("❌ Nu ești abonat la acest canal în acest chat.")
         return
 
-    logger.info("remove channel chat=%s yt_id=%s", chat_id, yt_id)
-    await update.message.reply_text(f"✅ Canal eliminat: {channel['name'] or yt_id}")
+    logger.info("remove channel chat=%s yt_id=%s", chat_id, channel["yt_id"])
+    await update.message.reply_text(
+        f"✅ <b>{escape(channel['name'] or channel['yt_id'])}</b> eliminat.",
+        parse_mode="HTML",
+    )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uptime = str(datetime.now(timezone.utc) - _startup_time).split(".")[0]
+    now = datetime.now(timezone.utc)
+
+    # Uptime
+    diff = now - _startup_time
+    up_h = int(diff.total_seconds() // 3600)
+    up_m = int((diff.total_seconds() % 3600) // 60)
+    uptime_str = f"{up_h}h {up_m}min" if up_h else f"{up_m}min"
+
+    # Next poll — APScheduler ticks at fixed offsets from startup time
+    interval_s = settings.poll_interval_minutes * 60
+    elapsed_s = diff.total_seconds()
+    remaining_s = interval_s - (elapsed_s % interval_s)
+    next_poll_str = f"~{int(remaining_s // 60)}min" if remaining_s > 60 else "imediat"
+
+    # Global counts
     total_videos = await fetch_value("SELECT COUNT(*) FROM videos WHERE summary IS NOT NULL")
-    total_channels = await fetch_value("SELECT COUNT(*) FROM yt_channels")
     total_chats = await fetch_value("SELECT COUNT(*) FROM chats")
-    await update.message.reply_text(
-        f"📊 Status Pulse\n\n"
-        f"⏱ Uptime: {uptime}\n"
-        f"💬 Chat-uri active: {total_chats or 0}\n"
-        f"📺 Canale urmărite: {total_channels or 0}\n"
-        f"🎬 Videoclipuri procesate: {total_videos or 0}\n"
-        f"🔄 Interval poll: {settings.poll_interval_minutes} minute"
+
+    # Last poll across all channels
+    last_poll = await fetch_value("SELECT MAX(checked_at) FROM yt_channels")
+
+    # Per-channel breakdown
+    channels = await fetch_all(
+        """
+        SELECT yc.name, yc.yt_id, yc.checked_at,
+               COUNT(v.id)         AS video_count,
+               MAX(v.processed_at) AS last_video_at
+          FROM yt_channels yc
+          LEFT JOIN videos v ON v.yt_channel_id = yc.id
+         GROUP BY yc.id, yc.name, yc.yt_id, yc.checked_at
+         ORDER BY yc.name
+        """
     )
+
+    lines = [
+        "📊 <b>Pulse — Status</b>",
+        "",
+        f"⏱ Uptime: {uptime_str}",
+        f"🔄 Poll interval: {settings.poll_interval_minutes} min",
+        f"🕐 Ultima verificare: {_rel_time(last_poll)}",
+        f"⏭ Urmăroarea verificare: {next_poll_str}",
+        "",
+        f"💬 Chat-uri active: {total_chats or 0}",
+        f"📺 Canale monitorizate: {len(channels)}",
+        f"🎬 Videoclipuri procesate total: {total_videos or 0}",
+    ]
+
+    if channels:
+        lines.append("")
+        lines.append("📋 <b>Activitate per canal:</b>")
+        for ch in channels:
+            name = escape(ch["name"] or ch["yt_id"])
+            checked = _rel_time(ch["checked_at"])
+            last_vid = _rel_time(ch["last_video_at"]) if ch["last_video_at"] else "niciunul încă"
+            count = ch["video_count"] or 0
+            lines.append(
+                f"\n• <b>{name}</b>\n"
+                f"  Verificat: {checked}\n"
+                f"  Ultimul video procesat: {last_vid}\n"
+                f"  Total procesate: {count}"
+            )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +309,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         vid=video_id,
     )
     if existing and existing["summary"]:
-        title_line = f"*{existing['title']}*\n\n" if existing.get("title") else ""
+        teaser, _full = split_summary(existing["summary"])
+        title_line = f"<b>{escape(existing['title'])}</b>\n\n" if existing.get("title") else ""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📖 Rezumat complet", callback_data=f"full:{video_id}")
+        ]])
         await update.message.reply_text(
-            f"🎬 {title_line}{existing['summary']}\n\n🔗 https://youtube.com/watch?v={video_id}",
-            parse_mode="Markdown",
+            f"🎬 {title_line}{escape(teaser)}\n\n🔗 https://youtube.com/watch?v={video_id}",
+            parse_mode="HTML",
+            reply_markup=keyboard,
         )
         logger.info("handle_message cache hit video=%s", video_id)
         return
@@ -232,11 +339,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     from pulse.youtube import get_video_title
     title = await get_video_title(video_id)
-    title_line = f"*{title}*\n\n" if title else ""
-
+    teaser, _full = split_summary(summary)
+    title_line = f"<b>{escape(title)}</b>\n\n" if title else ""
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📖 Rezumat complet", callback_data=f"full:{video_id}")
+    ]])
     await update.message.reply_text(
-        f"🎬 {title_line}{summary}\n\n🔗 https://youtube.com/watch?v={video_id}",
-        parse_mode="Markdown",
+        f"🎬 {title_line}{escape(teaser)}\n\n🔗 https://youtube.com/watch?v={video_id}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
     await execute(
@@ -258,6 +369,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # App builder
 # ---------------------------------------------------------------------------
 
+async def show_full_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: expand notification to full summary when user taps the button."""
+    query = update.callback_query
+    await query.answer()
+
+    video_id = query.data.split(":", 1)[1]
+    video = await fetch_one("SELECT title, summary FROM videos WHERE yt_id = :vid", vid=video_id)
+    if not video or not video["summary"]:
+        await query.answer("Rezumatul nu mai este disponibil.", show_alert=True)
+        return
+
+    _teaser, full = split_summary(video["summary"])
+    title_line = f"<b>{escape(video['title'])}</b>\n\n" if video.get("title") else ""
+    await query.edit_message_text(
+        f"🎬 {title_line}{escape(full)}\n\n🔗 https://youtube.com/watch?v={video_id}",
+        parse_mode="HTML",
+    )
+    logger.info("show_full_summary video=%s", video_id)
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("handler exception update=%s error=%s", update, context.error, exc_info=context.error)
+
+
 def build_app(bot_token: str):
     """Build and return the configured Telegram Application."""
     app = ApplicationBuilder().token(bot_token).build()
@@ -268,4 +403,6 @@ def build_app(bot_token: str):
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(show_full_summary, pattern=r"^full:"))
+    app.add_error_handler(_error_handler)
     return app
